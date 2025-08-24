@@ -10,22 +10,53 @@ GRANT SELECT ON edge.* TO 'reader'@'%';
 
 USE edge;
 
-/* ======= Global mirror ======= */
-CREATE TABLE IF NOT EXISTS global_mirror_versions (
+/* ======= Continent Data Versioning System ======= */
+CREATE TABLE IF NOT EXISTS continent_versions (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
   dataset_id VARCHAR(255) NOT NULL,
   version     VARCHAR(255) NOT NULL,
   checksum    VARCHAR(64)  NOT NULL,
   ts          BIGINT       NOT NULL,
-  UNIQUE KEY uniq_dataset_version (dataset_id, version)
+  parent_version VARCHAR(255) NULL,
+  diff_checksum VARCHAR(64) NULL,
+  status ENUM('processing', 'ready', 'failed') DEFAULT 'processing',
+  UNIQUE KEY uniq_dataset_version (dataset_id, version),
+  KEY idx_parent_version (dataset_id, parent_version),
+  KEY idx_status (status)
 );
 
-CREATE TABLE IF NOT EXISTS global_rows (
+CREATE TABLE IF NOT EXISTS continent_rows (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
   dataset_id VARCHAR(255) NOT NULL,
   version     VARCHAR(255) NOT NULL,
   item        JSON         NOT NULL,
   KEY idx_dataset_version (dataset_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS continent_diffs (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  dataset_id VARCHAR(255) NOT NULL,
+  version     VARCHAR(255) NOT NULL,
+  diff_type   ENUM('add', 'update', 'delete') NOT NULL,
+  item_id     VARCHAR(255) NOT NULL,
+  old_item    JSON         NULL,
+  new_item    JSON         NULL,
+  ts          BIGINT       NOT NULL,
+  KEY idx_dataset_version (dataset_id, version),
+  KEY idx_item_id (dataset_id, item_id),
+  KEY idx_diff_type (diff_type)
+);
+
+CREATE TABLE IF NOT EXISTS continent_cache (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  dataset_id VARCHAR(255) NOT NULL,
+  version     VARCHAR(255) NOT NULL,
+  data        JSON         NOT NULL,
+  checksum    VARCHAR(64)  NOT NULL,
+  ts          BIGINT       NOT NULL,
+  expires_at  BIGINT       NOT NULL,
+  UNIQUE KEY uniq_dataset_cache (dataset_id, version),
+  KEY idx_expires (expires_at)
 );
 
 CREATE TABLE IF NOT EXISTS user_contexts (
@@ -43,7 +74,7 @@ CREATE TABLE IF NOT EXISTS user_views (
   dataset_id VARCHAR(255) NOT NULL,
   version     VARCHAR(255) NOT NULL,
   item        JSON         NOT NULL,
-  ts          BIGINT       NOT NULL,
+  ts         BIGINT       NOT NULL,
   KEY idx_user_dataset_version (user_id, dataset_id, version)
 );
 

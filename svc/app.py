@@ -7,9 +7,10 @@ from temporalio.client import Client
 from db import (
     fetchone, fetchall, execute, executemany,
     ensure_user_table, ensure_generated_index, _hash_name,
+    get_conn,
 )
 
-from cache import pub
+from cache import pub, REDIS
 
 app = FastAPI(title="PG Context Engine", version="0.0.1")
 
@@ -22,25 +23,238 @@ async def tclient():
         _temporal["client"] = await Client.connect(TEMPORAL_TARGET)
     return _temporal["client"]
 
-# ======== GLOBAL MIRROR ========
+# ======== CONTINENT DATA VERSIONING SYSTEM ========
 
-class MirrorPayload(BaseModel):
-    version: str
+class ContinentPayload(BaseModel):
     rows: List[Dict[str, Any]]
 
-@app.post("/mirror/global/{dataset_id}")
-async def upload_mirror(dataset_id: str, body: MirrorPayload):
+@app.post("/continent/{dataset_id}")
+async def upload_continent(dataset_id: str, body: ContinentPayload):
+    """POST: Immediately cache data and return success, then process asynchronously"""
     if not body.rows:
         raise HTTPException(400, "rows[] required")
+    
+    # Generate version internally based on timestamp and checksum
+    ts = int(time.time())
     checksum = hashlib.sha256(orjson.dumps(body.rows)).hexdigest()
+    version = f"v{ts}.{checksum[:8]}"  # Format: v{timestamp}.{first8chars_of_checksum}
+    
+    # Start async workflow for background processing
     client = await tclient()
     handle = await client.start_workflow(
-        "MirrorIngestWorkflow",
-        args=[dataset_id, body.version, checksum, body.rows],
-        id=f"mirror-{dataset_id}-{body.version}-{int(time.time())}",
+        "ContinentIngestWorkflow",
+        args=[dataset_id, version, checksum, body.rows],
+        id=f"continent-{dataset_id}-{version}-{ts}",
         task_queue=TASK_QUEUE,
     )
-    return {"ok": True, "workflow_id": handle.id, "checksum": checksum}
+    
+    return {
+        "ok": True, 
+        "workflow_id": handle.id, 
+        "version": version,
+        "checksum": checksum,
+        "message": "Data cached immediately, processing in background"
+    }
+
+@app.put("/continent/{dataset_id}")
+async def update_continent(dataset_id: str, body: ContinentPayload):
+    """PUT: Same as POST - immediately cache and process asynchronously"""
+    return await upload_continent(dataset_id, body)
+
+@app.get("/continent/{dataset_id}")
+async def get_continent(dataset_id: str, version: Optional[str] = None):
+    """GET: Fast response from cache, falls back to database if needed"""
+    
+    # Try to get from Redis cache first
+    if version:
+        cache_key = f"continent:{dataset_id}:{version}"
+    else:
+        # Get latest version from cache
+        latest_key = f"continent:{dataset_id}:latest"
+        latest_version = REDIS.get(latest_key)
+        if latest_version:
+            cache_key = f"continent:{dataset_id}:{latest_version.decode()}"
+        else:
+            cache_key = None
+    
+    if cache_key:
+        cached_data = REDIS.get(cache_key)
+        if cached_data:
+            try:
+                data = orjson.loads(cached_data)
+                return {
+                    "ok": True,
+                    "source": "cache",
+                    "data": data
+                }
+            except:
+                pass  # Fall through to database
+    
+    # Fallback to database
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    
+    if version:
+        # Get specific version
+        cur.execute("""
+            SELECT cv.*, COUNT(cr.id) as row_count
+            FROM continent_versions cv
+            LEFT JOIN continent_rows cr ON cv.dataset_id = cr.dataset_id AND cv.version = cr.version
+            WHERE cv.dataset_id = %s AND cv.version = %s AND cv.status = 'ready'
+            GROUP BY cv.id
+        """, (dataset_id, version))
+    else:
+        # Get latest version
+        cur.execute("""
+            SELECT cv.*, COUNT(cr.id) as row_count
+            FROM continent_versions cv
+            LEFT JOIN continent_rows cr ON cv.dataset_id = cr.dataset_id AND cv.version = cr.version
+            WHERE cv.dataset_id = %s AND cv.status = 'ready'
+            GROUP BY cv.id
+            ORDER BY cv.ts DESC
+            LIMIT 1
+        """, (dataset_id,))
+    
+    version_info = cur.fetchone()
+    if not version_info:
+        cur.close()
+        conn.close()
+        raise HTTPException(404, "Dataset or version not found")
+    
+    # Get the actual rows
+    cur.execute("SELECT item FROM continent_rows WHERE dataset_id = %s AND version = %s", 
+                (dataset_id, version_info['version']))
+    rows = [orjson.loads(row['item']) for row in cur.fetchall()]
+    
+    cur.close()
+    conn.close()
+    
+    # Cache this result for future fast access
+    cache_data = {
+        "version": version_info['version'],
+        "checksum": version_info['checksum'],
+        "ts": version_info['ts'],
+        "rows": rows,
+        "count": len(rows),
+        "parent_version": version_info.get('parent_version'),
+        "diff_checksum": version_info.get('diff_checksum')
+    }
+    
+    cache_key = f"continent:{dataset_id}:{version_info['version']}"
+    REDIS.setex(cache_key, 86400, orjson.dumps(cache_data).decode())
+    
+    # Update latest version cache
+    REDIS.setex(f"continent:{dataset_id}:latest", 86400, version_info['version'])
+    
+    return {
+        "ok": True,
+        "source": "database",
+        "data": cache_data
+    }
+
+@app.get("/continent/{dataset_id}/versions")
+async def list_continent_versions(dataset_id: str, limit: int = Query(10, ge=1, le=100)):
+    """Get list of available versions for a dataset"""
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    
+    cur.execute("""
+        SELECT cv.*, COUNT(cr.id) as row_count
+        FROM continent_versions cv
+        LEFT JOIN continent_rows cr ON cv.dataset_id = cr.dataset_id AND cv.version = cr.version
+        WHERE cv.dataset_id = %s AND cv.status = 'ready'
+        GROUP BY cv.id
+        ORDER BY cv.ts DESC
+        LIMIT %s
+    """, (dataset_id, limit))
+    
+    versions = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    return {
+        "ok": True,
+        "dataset_id": dataset_id,
+        "versions": versions
+    }
+
+@app.get("/continent/{dataset_id}/diff/{version}")
+async def get_continent_diff(dataset_id: str, version: str):
+    """Get diffs for a specific version (useful for island systems)"""
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    
+    # Get version info
+    cur.execute("""
+        SELECT * FROM continent_versions 
+        WHERE dataset_id = %s AND version = %s AND status = 'ready'
+    """, (dataset_id, version))
+    
+    version_info = cur.fetchone()
+    if not version_info:
+        cur.close()
+        conn.close()
+        raise HTTPException(404, "Version not found")
+    
+    # Get diffs
+    cur.execute("""
+        SELECT * FROM continent_diffs 
+        WHERE dataset_id = %s AND version = %s
+        ORDER BY ts ASC
+    """, (dataset_id, version))
+    
+    diffs = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    return {
+        "ok": True,
+        "dataset_id": dataset_id,
+        "version": version,
+        "parent_version": version_info.get('parent_version'),
+        "diff_checksum": version_info.get('diff_checksum'),
+        "diffs": diffs,
+        "diff_count": len(diffs)
+    }
+
+@app.get("/continent/{dataset_id}/incremental/{from_version}/{to_version}")
+async def get_incremental_update(dataset_id: str, from_version: str, to_version: str):
+    """Get incremental update between two versions (for island systems)"""
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    
+    # Validate versions exist
+    cur.execute("""
+        SELECT version FROM continent_versions 
+        WHERE dataset_id = %s AND version IN (%s, %s) AND status = 'ready'
+    """, (dataset_id, from_version, to_version))
+    
+    versions = [row['version'] for row in cur.fetchall()]
+    if len(versions) != 2:
+        cur.close()
+        conn.close()
+        raise HTTPException(404, "One or both versions not found")
+    
+    # Get diffs for the target version
+    cur.execute("""
+        SELECT * FROM continent_diffs 
+        WHERE dataset_id = %s AND version = %s
+        ORDER BY ts ASC
+    """, (dataset_id, to_version))
+    
+    diffs = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    return {
+        "ok": True,
+        "dataset_id": dataset_id,
+        "from_version": from_version,
+        "to_version": to_version,
+        "diffs": diffs,
+        "diff_count": len(diffs),
+        "message": "Apply these diffs to your local copy of from_version to get to_version"
+    }
 
 class Ctx(BaseModel):
     filters: Optional[Dict[str, Any]] = None
@@ -62,7 +276,7 @@ async def set_ctx(user_id: str, dataset_id: str, ctx: Ctx):
 def sql_urls():
     return {
         "read_write_mysql": f"mysql://{os.getenv('MYSQL_USER', 'edge')}:{os.getenv('MYSQL_PASS', 'edgepass')}@{os.getenv('MYSQL_HOST', 'localhost')}:{os.getenv('MYSQL_PORT', '3307')}/{os.getenv('MYSQL_DB', 'edge')}",
-        "read_only_mysql":  f"mysql://reader:readpass@{os.getenv('MYSQL_HOST', 'localhost')}:{os.getenv('MYSQL_PORT', '3307')}/{os.getenv('MYSQL_DB', 'edge')}",
+        "read_only_mysql":  f"mysql://reader:readpass@{os.getenv('MYSQL_HOST', 'localhost')}:{os.getenv('MYSQL_PORT', '3307')}:{os.getenv('MYSQL_DB', 'edge')}",
         "notes": "Query user tables directly; names are hashed, use /userdb/{user}/{table}/info to discover.",
     }
 
@@ -168,7 +382,7 @@ class DeleteBatch(BaseModel):
 def delete_rows(user_id: str, table: str, body: DeleteBatch):
     meta = fetchone("SELECT * FROM userdb_tables WHERE user_id=%s AND table_name=%s", (user_id, table))
     if not meta:
-        raise HTTPException(404, "Register schema first")
+        raise HTTPException(404, "Delete schema first")
     phy = meta["phy_table"]
     if not body.pks:
         return {"ok": True, "count": 0}

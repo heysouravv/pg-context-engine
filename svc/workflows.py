@@ -2,21 +2,40 @@ from datetime import timedelta
 from temporalio import workflow, activity
 
 @workflow.defn
-class MirrorIngestWorkflow:
+class ContinentIngestWorkflow:
     @workflow.run
     async def run(self, dataset_id: str, version: str, checksum: str, rows: list[dict]):
+        # Step 1: Validate the data
         await workflow.execute_activity(
-            "validate_mirror",
+            "validate_continent",
             args=[dataset_id, version, checksum, len(rows)],
             schedule_to_close_timeout=timedelta(seconds=30),
         )
+        
+        # Step 2: Immediately cache the data for fast GET responses
         await workflow.execute_activity(
-            "commit_global_mirror",
+            "cache_continent_data",
+            args=[dataset_id, version, checksum, rows],
+            schedule_to_close_timeout=timedelta(seconds=60),
+        )
+        
+        # Step 3: Compute diffs asynchronously
+        diff_result = await workflow.execute_activity(
+            "compute_continent_diff",
             args=[dataset_id, version, checksum, rows],
             schedule_to_close_timeout=timedelta(seconds=120),
         )
+        
+        # Step 4: Commit to database asynchronously (after caching)
         await workflow.execute_activity(
-            "fanout_global_update",
+            "commit_continent_data",
+            args=[dataset_id, version, checksum, rows, diff_result.get("parent_version"), diff_result.get("diff_checksum")],
+            schedule_to_close_timeout=timedelta(seconds=180),
+        )
+        
+        # Step 5: Notify subscribers
+        await workflow.execute_activity(
+            "fanout_continent_update",
             args=[dataset_id, version],
             schedule_to_close_timeout=timedelta(seconds=15),
         )

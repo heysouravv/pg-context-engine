@@ -1,9 +1,10 @@
 import asyncio, os
 from temporalio.client import Client
 from temporalio.worker import Worker
-from workflows import MirrorIngestWorkflow, UserContextWorkflow
+from workflows import ContinentIngestWorkflow, UserContextWorkflow
 from activities import (
-    validate_mirror, commit_global_mirror, fanout_global_update,
+    validate_continent, cache_continent_data, compute_continent_diff, 
+    commit_continent_data, fanout_continent_update,
     store_user_ctx, project_view
 )
 
@@ -12,9 +13,10 @@ async def main():
     worker = Worker(
         client,
         task_queue=os.getenv("TASK_QUEUE","edge-tq"),
-        workflows=[MirrorIngestWorkflow, UserContextWorkflow],
+        workflows=[ContinentIngestWorkflow, UserContextWorkflow],
         activities=[
-            validate_mirror, commit_global_mirror, fanout_global_update,
+            validate_continent, cache_continent_data, compute_continent_diff,
+            commit_continent_data, fanout_continent_update,
             store_user_ctx, project_view
         ],
     )
