@@ -1,0 +1,127 @@
+services:
+  redis:
+    image: redis:7.2
+    ports: ["6380:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: edge
+      MYSQL_USER: edge
+      MYSQL_PASSWORD: edgepass
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-prootpass"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  temporal:
+    image: temporalio/auto-setup:1.25
+    environment:
+      - DB=mysql8
+      - MYSQL_SEEDS=mysql
+      - MYSQL_USER=root
+      - MYSQL_PWD=rootpass
+      - DBNAME=edge
+    ports:
+      - "7234:7233"   # gRPC
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  temporal-ui:
+    image: temporalio/ui:2.25.0
+    container_name: temporal-ui
+    depends_on:
+      - temporal
+    ports:
+      - "8234:8080"   # Web UI (mapped to 8234 for consistency)
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=default
+    restart: unless-stopped
+
+  svc-base:
+    build:
+      context: .
+      dockerfile: ./svc/Dockerfile
+    image: edge-svc:latest
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_DB: edge
+      MYSQL_USER: edge
+      MYSQL_PASS: edgepass
+      TEMPORAL_TARGET: temporal:7233
+      TASK_QUEUE: edge-tq
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+
+  edge:
+    build:
+      context: .
+      dockerfile: ./svc/Dockerfile
+    image: edge-svc:latest
+    command: uvicorn app:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_DB: edge
+      MYSQL_USER: edge
+      MYSQL_PASS: edgepass
+      TEMPORAL_TARGET: temporal:7233
+      TASK_QUEUE: edge-tq
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+
+  worker:
+    build:
+      context: .
+      dockerfile: ./svc/Dockerfile
+    image: edge-svc:latest
+    command: python -u worker.py
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_DB: edge
+      MYSQL_USER: edge
+      MYSQL_PASS: edgepass
+      TEMPORAL_TARGET: temporal:7233
+      TASK_QUEUE: edge-tq
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+
+volumes:
+  mysql_data:

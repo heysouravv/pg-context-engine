@@ -1,0 +1,6 @@
+---
+alwaysApply: true
+---
+always use the mcp-docs tool to see avaiable docs for things like temporal , langgraph and adk.
+
+before write code for any of these please refer to the doc , check the syntaxs first and then write.
